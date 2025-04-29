@@ -47,7 +47,7 @@ connectToDatabase().catch(console.error)
 
 // --- Estrategia de acumulación ---
 const CONVERSATION_WINDOW_MINUTES = 5 // Considerar mensajes de los últimos 5 minutos
-const MESSAGE_WAIT_TIME_MS = 8000 // Tiempo de espera para acumular mensajes (8 segundos)
+const BATCH_TIME_WINDOW_MS = 2000 // Ventana de tiempo para considerar mensajes "en ráfaga" (2 segundos)
 // ------------------------------------
 
 // Inicializar OpenAI (ya incluye GPT-4o con visión)
@@ -69,62 +69,95 @@ type ResponseData = {
 }
 
 /**
- * Verifica si hay mensajes pendientes para un chat y los procesa después de un tiempo de espera
+ * Procesa los mensajes de un chat, verificando si son parte de una "ráfaga" reciente
  */
-async function scheduleProcessing(chatId: number) {
-  console.log(`[${chatId}] Programando procesamiento para dentro de ${MESSAGE_WAIT_TIME_MS/1000} segundos`)
-  
-  // Esperar el tiempo definido para acumular más mensajes potenciales
-  setTimeout(async () => {
-    try {
-      const { conversationsCollection } = await connectToDatabase()
-      
-      // Verificar si hay mensajes sin procesar más recientes que MESSAGE_WAIT_TIME_MS
-      // Si los hay, no procesamos para dar tiempo a que se acumulen más mensajes
-      const now = new Date()
-      const cutoffTime = new Date(now.getTime() - MESSAGE_WAIT_TIME_MS)
-      
-      const recentMessages = await conversationsCollection.find({
-        chatId: chatId,
-        timestamp: { $gt: cutoffTime },
-        status: "pending"
-      }).toArray()
-      
-      if (recentMessages.length > 0) {
-        console.log(`[${chatId}] Detectados ${recentMessages.length} mensajes muy recientes, postergando procesamiento`)
-        // Reprogramar para más tarde
-        scheduleProcessing(chatId)
-        return
-      }
-      
-      // No hay mensajes recientes, verificar si hay alguno pendiente
-      const pendingMessages = await conversationsCollection.find({
-        chatId: chatId,
-        status: "pending"
-      }).toArray()
-      
-      if (pendingMessages.length === 0) {
-        console.log(`[${chatId}] No hay mensajes pendientes para procesar`)
-        return
-      }
-      
-      console.log(`[${chatId}] Procesando ${pendingMessages.length} mensajes acumulados`)
-      // Marcar mensajes como "processing" para evitar doble procesamiento
-      await conversationsCollection.updateMany(
-        { chatId: chatId, status: "pending" },
-        { $set: { status: "processing" } }
-      )
-      
-      // Procesar la conversación
-      await processConversation(chatId)
-      
-    } catch (error: any) {
-      console.error(`[${chatId}] Error en scheduleProcessing:`, error?.message)
+async function processMessagesForChat(chatId: number, newMessageId: number, force: boolean = false) {
+  try {
+    console.log(`[${chatId}] Iniciando procesamiento para mensaje ${newMessageId} (force=${force})`)
+    
+    const { conversationsCollection } = await connectToDatabase()
+
+    // Paso 1: Verificar si hay mensajes recientes (dentro de la ventana de tiempo de batch)
+    const now = new Date()
+    const cutoffTime = new Date(now.getTime() - BATCH_TIME_WINDOW_MS)
+    
+    // Contar mensajes recientes recibidos (dentro de la ventana de batch, excluyendo el actual)
+    const recentCount = await conversationsCollection.countDocuments({
+      chatId: chatId,
+      message_id: { $ne: newMessageId },
+      timestamp: { $gte: cutoffTime },
+      status: "pending"
+    })
+
+    // Si hay mensajes recientes y no estamos forzando el procesamiento,
+    // postergamos el procesamiento para permitir acumular más mensajes
+    if (recentCount > 0 && !force) {
+      console.log(`[${chatId}] Detectados ${recentCount} mensajes recientes, postergando procesamiento`)
+      return
     }
-  }, MESSAGE_WAIT_TIME_MS)
+    
+    // Paso 2: Obtener todos los mensajes pendientes para este chat
+    const pendingMessages = await conversationsCollection.find({
+      chatId: chatId,
+      status: "pending"
+    }).sort({ timestamp: 1 }).toArray()
+    
+    if (pendingMessages.length === 0) {
+      console.log(`[${chatId}] No hay mensajes pendientes para procesar`)
+      return
+    }
+    
+    console.log(`[${chatId}] Procesando ${pendingMessages.length} mensajes acumulados`)
+    
+    // Paso 3: Marcar mensajes como "processing"
+    const messageIds = pendingMessages.map(m => m._id)
+    await conversationsCollection.updateMany(
+      { _id: { $in: messageIds } },
+      { $set: { status: "processing" } }
+    )
+    
+    // Paso 4: Procesar la conversación
+    const result = await processConversation(chatId)
+    
+    if (result) {
+      console.log(`[${chatId}] Procesamiento exitoso para ${pendingMessages.length} mensajes`)
+    } else {
+      console.log(`[${chatId}] El procesamiento no generó respuesta`)
+      
+      // Si no había suficiente contenido para procesar, reprogramar para
+      // forzar el procesamiento después de un tiempo
+      if (pendingMessages.length < 3) {
+        console.log(`[${chatId}] Pocos mensajes acumulados (${pendingMessages.length}), intentando forzar procesamiento después`)
+        
+        // Necesitamos programar otra función serverless para procesar más tarde
+        // Esto es solo para depuración - en producción necesitaríamos un mecanismo real
+        try {
+          // Llamada a nuestro propio endpoint para forzar el procesamiento
+          const baseUrl = process.env.VERCEL_URL 
+            ? `https://${process.env.VERCEL_URL}`
+            : 'http://localhost:3000';
+          
+          // Programar una llamada en 5 segundos a nuestro propio endpoint
+          setTimeout(async () => {
+            try {
+              console.log(`[${chatId}] Intentando forzar procesamiento después de espera`)
+              await processMessagesForChat(chatId, newMessageId, true)
+            } catch (err) {
+              console.error(`[${chatId}] Error al forzar procesamiento:`, err)
+            }
+          }, 5000)
+        } catch (fetchError) {
+          console.error(`[${chatId}] Error al programar procesamiento forzado:`, fetchError)
+        }
+      }
+    }
+    
+  } catch (error: any) {
+    console.error(`[${chatId}] Error en processMessagesForChat:`, error?.message)
+  }
 }
 
-// --- Handler principal ---
+// --- Handler principal (webhook) ---
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<ResponseData>
@@ -140,6 +173,7 @@ export default async function handler(
     if (update && update.message && update.message.chat && update.message.chat.id) {
       const chatId = update.message.chat.id
       const messageData = update.message
+      const messageId = messageData.message_id
 
       // Conectar a DB (o reusar conexión)
       const { conversationsCollection } = await connectToDatabase()
@@ -149,6 +183,7 @@ export default async function handler(
         await conversationsCollection.insertOne({
           chatId: chatId,
           message: messageData,
+          message_id: messageId,
           timestamp: new Date(),
           status: "processed" // Ya procesado directamente
         })
@@ -161,16 +196,17 @@ export default async function handler(
       await conversationsCollection.insertOne({
         chatId: chatId,
         message: messageData,
+        message_id: messageId,
         timestamp: new Date(),
         status: "pending" // Pendiente de procesamiento
       })
-      console.log(`[${chatId}] Message saved to DB (ID: ${messageData.message_id}) - pending`)
+      console.log(`[${chatId}] Message saved to DB (ID: ${messageId}) - pending`)
 
-      // Programar procesamiento después de un tiempo de espera
-      scheduleProcessing(chatId)
+      // Procesar mensajes (o postergar si son parte de una ráfaga)
+      await processMessagesForChat(chatId, messageId)
 
       // Responder a Telegram inmediatamente para no bloquear
-      res.status(200).json({ message: 'Update received and scheduled for processing' })
+      res.status(200).json({ message: 'Update received and queued for processing' })
 
     } else {
       console.log('Received update without message or chat ID:', JSON.stringify(update))
@@ -183,8 +219,8 @@ export default async function handler(
   }
 }
 
-// Modificar processConversation para usar el status
-async function processConversation(chatId: number) {
+// Modificar processConversation para usar el status y retornar resultado
+async function processConversation(chatId: number): Promise<boolean> {
   console.log(`[${chatId}] ---- Entering processConversation ----`);
   try {
     const { conversationsCollection } = await connectToDatabase()
@@ -200,7 +236,7 @@ async function processConversation(chatId: number) {
 
     if (messages.length === 0) {
       console.log(`[${chatId}] No messages found to process.`)
-      return
+      return false
     }
     
     let userMessageContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = []
@@ -234,7 +270,7 @@ async function processConversation(chatId: number) {
           const whisperResult = await whisperResponse.json()
           if (!whisperResponse.ok) throw new Error(`Whisper API Error: ${whisperResult?.error?.message}`)
           textPart = whisperResult.text
-          userMessageContent.push({ type: "text", text: `(Audio transcrito: ${textPart})` }) // Añadir contexto
+          userMessageContent.push({ type: "text", text: `(Audio transcrito: ${textPart})` })
           console.log(`[${chatId}] Transcription successful for message ${message.message_id}`)
         } catch (error: any) {
           console.error(`[${chatId}] Error during transcription for message ${message.message_id}:`, error.message)
@@ -264,7 +300,7 @@ async function processConversation(chatId: number) {
       }
     }
 
-    console.log(`[${chatId}] Constructed userMessageContent:`, JSON.stringify(userMessageContent));
+    console.log(`[${chatId}] Constructed userMessageContent with ${userMessageContent.length} parts`);
 
     if (userMessageContent.length === 0) {
       console.log(`[${chatId}] No processable content found for GPT.`)
@@ -274,7 +310,7 @@ async function processConversation(chatId: number) {
         { $set: { status: "processed" } }
       )
       console.log(`[${chatId}] Marked messages as processed.`)
-      return
+      return false
     }
 
     try {
@@ -294,21 +330,39 @@ async function processConversation(chatId: number) {
       })
       
       const reply = completion.choices[0]?.message?.content || 'Lo siento, no pude procesar tu consulta en este momento.'
-      console.log(`[${chatId}] GPT Response generated.`)
+      console.log(`[${chatId}] GPT Response generated: ${reply.substring(0, 50)}...`);
       
-      await bot.sendMessage(chatId, reply)
-      console.log(`[${chatId}] Response sent.`)
+      try {
+        await bot.sendMessage(chatId, reply)
+        console.log(`[${chatId}] Response sent to Telegram.`)
+      } catch (sendError: any) {
+        console.error(`[${chatId}] ERROR ENVIANDO MENSAJE A TELEGRAM:`, sendError?.message)
+        // Intentar enviar nuevamente con un mensaje de error en caso de fallar
+        try {
+          await bot.sendMessage(chatId, 'Lo siento, tuve un problema al enviar mi respuesta. Por favor, intenta nuevamente.')
+        } catch (e) {
+          console.error(`[${chatId}] ERROR FATAL AL ENVIAR MENSAJE DE ERROR:`, e)
+        }
+      }
 
       // Marcar mensajes como procesados
       await conversationsCollection.updateMany(
         { chatId: chatId, _id: { $in: messages.map(m => m._id) } },
         { $set: { status: "processed" } }
       )
-      console.log(`[${chatId}] Marked messages as processed.`)
+      console.log(`[${chatId}] Marked ${messages.length} messages as processed.`)
+      
+      return true // Procesamiento exitoso
 
     } catch (error: any) {
       console.error(`[${chatId}] Error with OpenAI API call:`, error?.message)
-      await bot.sendMessage(chatId, 'Lo siento, hubo un error al intentar generar una respuesta. Por favor, intenta de nuevo.')
+      
+      try {
+        await bot.sendMessage(chatId, 'Lo siento, hubo un error al intentar generar una respuesta. Por favor, intenta de nuevo.')
+        console.log(`[${chatId}] Error message sent to user.`)
+      } catch (sendError: any) {
+        console.error(`[${chatId}] CRITICAL: Failed to send error message:`, sendError?.message)
+      }
       
       // En caso de error, marcar mensajes como fallidos pero no eliminarlos
       await conversationsCollection.updateMany(
@@ -316,10 +370,20 @@ async function processConversation(chatId: number) {
         { $set: { status: "error" } }
       )
       console.log(`[${chatId}] Marked messages as error.`)
+      
+      return false // Procesamiento fallido
     }
 
   } catch (processError: any) {
     console.error(`[${chatId}] Error in processConversation function:`, processError.message)
-    await bot.sendMessage(chatId, 'Lo siento, ocurrió un error interno grave al procesar tu conversación.').catch(e => console.error("Failed to send process error message to user:", e))
+    
+    try {
+      await bot.sendMessage(chatId, 'Lo siento, ocurrió un error interno grave al procesar tu conversación.')
+      console.log(`[${chatId}] Critical error message sent to user.`)
+    } catch (e) {
+      console.error(`[${chatId}] CRITICAL: Failed to send critical error message:`, e)
+    }
+    
+    return false // Procesamiento fallido
   }
 } 
