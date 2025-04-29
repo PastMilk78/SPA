@@ -474,4 +474,137 @@ Si hay imágenes, analízalas en el contexto de Solar Pro (producto, factura, in
     
     return false
   }
+}
+
+/**
+ * Función exportada para ser llamada desde el cron job
+ */
+export async function processConversationFromCron(
+  chatId: number, 
+  messagesToProcess: any[], 
+  historyMessages: any[]
+): Promise<boolean> {
+  console.log(`[${chatId}][CRON] Procesando conversación desde cron job`);
+  try {
+    // Combinamos y ordenamos los mensajes
+    const allMessages = [...historyMessages, ...messagesToProcess].sort((a, b) => {
+      return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+    });
+    
+    console.log(`[${chatId}][CRON] Total ${allMessages.length} mensajes (${messagesToProcess.length} nuevos, ${historyMessages.length} históricos)`);
+    
+    // Construir el contenido para OpenAI con todos los mensajes
+    let userMessageContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [];
+    
+    for (const msgDoc of allMessages) {
+      const message = msgDoc.message;
+      let textPart = '';
+      let imageBase64 = '';
+
+      if (message.text) {
+        if (!message.text.startsWith('/')) {
+          textPart = message.text;
+          userMessageContent.push({ type: "text", text: textPart });
+        }
+      } else if (message.voice) {
+        // Procesamiento de audio
+        try {
+          const fileId = message.voice.file_id;
+          const fileLink = await bot.getFileLink(fileId);
+          const audioResponse = await fetch(fileLink);
+          if (!audioResponse.ok || !audioResponse.body) throw new Error('Failed to download audio');
+          const form = new FormData();
+          form.append('file', audioResponse.body, { filename: 'audio.ogg', contentType: 'audio/ogg' });
+          form.append('model', 'whisper-1');
+          const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, ...form.getHeaders() },
+            body: form
+          });
+          const whisperResult = await whisperResponse.json();
+          if (!whisperResponse.ok) throw new Error(`Whisper API Error: ${whisperResult?.error?.message}`);
+          textPart = whisperResult.text;
+          userMessageContent.push({ type: "text", text: `(Audio transcrito: ${textPart})` });
+        } catch (error: any) {
+          console.error(`[${chatId}][CRON] Error transcribiendo audio:`, error.message);
+          userMessageContent.push({ type: "text", text: `(Error al transcribir audio)` });
+        }
+      } else if (message.photo) {
+        // Procesamiento de imagen
+        try {
+          const photo = message.photo[message.photo.length - 1];
+          const fileId = photo.file_id;
+          const fileLink = await bot.getFileLink(fileId);
+          const imageResponse = await fetch(fileLink);
+          if (!imageResponse.ok) throw new Error('Failed to download photo');
+          const imageBuffer = await imageResponse.buffer();
+          imageBase64 = imageBuffer.toString('base64');
+          userMessageContent.push({ type: "text", text: "Analiza la siguiente imagen enviada por el usuario en el contexto de Solar Pro Argentina." });
+          userMessageContent.push({ 
+            type: "image_url", 
+            image_url: { url: `data:image/jpeg;base64,${imageBase64}` }
+          });
+        } catch (error: any) {
+          console.error(`[${chatId}][CRON] Error procesando imagen:`, error.message);
+          userMessageContent.push({ type: "text", text: `(Error al procesar imagen)` });
+        }
+      }
+    }
+
+    if (userMessageContent.length === 0) {
+      console.log(`[${chatId}][CRON] No hay contenido procesable`);
+      return false;
+    }
+
+    // Preparar mensaje para GPT
+    const systemMessage = `Actúas como un asesor de Solar Pro Argentina (https://solarproargentina.com/). 
+Eres parte del equipo humano. No menciones que eres IA. 
+
+CONTEXTO: A continuación verás una conversación que puede incluir mensajes recientes y anteriores. 
+IMPORTANTE: Debes entender el HILO COMPLETO de la conversación, no solo responder al último mensaje.
+Analiza todos los mensajes del usuario para dar una respuesta coherente.
+
+Tu misión es resolver dudas sobre paneles solares, explicar beneficios, informar sobre servicios (domiciliarios, comerciales, industriales), 
+promover cotizaciones gratuitas (web/WhatsApp) y generar confianza (compromiso, sustentabilidad, calidad, atención personalizada). 
+
+Usa lenguaje sencillo y cálido. No inventes precios/productos. Si no sabes algo, invita a contactar a un asesor. 
+Evita tecnicismos excesivos. Sé cordial y enfócate en lo que el cliente está preguntando.
+
+Si hay imágenes, analízalas en el contexto de Solar Pro (producto, factura, instalación relevante?). Nunca digas que eres un bot.`;
+
+    // Llamar a GPT-4o
+    console.log(`[${chatId}][CRON] Enviando ${userMessageContent.length} partes a GPT-4o`);
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o", 
+      messages: [
+        { role: "system", content: systemMessage },
+        { role: "user", content: userMessageContent }
+      ],
+    });
+    
+    const reply = completion.choices[0]?.message?.content || 'Lo siento, no pude procesar tu consulta en este momento.';
+    console.log(`[${chatId}][CRON] Respuesta generada: ${reply.substring(0, 50)}...`);
+    
+    // Enviar respuesta
+    try {
+      await bot.sendMessage(chatId, reply);
+      console.log(`[${chatId}][CRON] Respuesta enviada correctamente`);
+      
+      // Actualizar estado de los mensajes procesados en la base de datos
+      const { conversationsCollection } = await connectToDatabase();
+      await conversationsCollection.updateMany(
+        { _id: { $in: messagesToProcess.map(m => m._id) } },
+        { $set: { status: "processed" } }
+      );
+      
+      console.log(`[${chatId}][CRON] ${messagesToProcess.length} mensajes marcados como procesados`);
+      return true;
+    } catch (sendError: any) {
+      console.error(`[${chatId}][CRON] ERROR ENVIANDO RESPUESTA:`, sendError.message);
+      return false;
+    }
+  } catch (error: any) {
+    console.error(`[${chatId}][CRON] Error general en processConversationFromCron:`, error.message);
+    return false;
+  }
 } 
