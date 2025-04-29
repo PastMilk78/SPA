@@ -49,6 +49,7 @@ connectToDatabase().catch(console.error)
 const CONVERSATION_WINDOW_MINUTES = 30 // Aumentamos la ventana a 30 minutos para más contexto
 const BATCH_TIME_WINDOW_MS = 2000 // Ventana de tiempo para considerar mensajes "en ráfaga" (2 segundos)
 const MAX_CONVERSATION_HISTORY = 15 // Máximo número de mensajes a incluir en el historial
+const FORCED_DELAY_MS = 15000 // Espera forzada de 15 segundos antes de responder
 // ------------------------------------
 
 // Inicializar OpenAI (ya incluye GPT-4o con visión)
@@ -108,13 +109,60 @@ async function processMessagesForChat(chatId: number, newMessageId: number, forc
       return
     }
     
-    console.log(`[${chatId}] Procesando ${pendingMessages.length} mensajes acumulados`)
+    // CAMBIO IMPORTANTE: Verificar tiempo desde el último mensaje
+    // Obtener timestamp del mensaje más reciente
+    const latestMsg = pendingMessages[pendingMessages.length - 1]
+    const latestMsgTime = new Date(latestMsg.timestamp).getTime()
+    const currentTime = Date.now()
+    const timeSinceLastMsg = currentTime - latestMsgTime
+    
+    // Si no han pasado al menos 15 segundos desde el último mensaje Y no estamos forzando, salimos
+    // En el siguiente mensaje verificaremos de nuevo
+    if (timeSinceLastMsg < FORCED_DELAY_MS && !force) {
+      console.log(`[${chatId}] Solo han pasado ${Math.round(timeSinceLastMsg/1000)} segundos desde el último mensaje. Necesitamos al menos ${Math.round(FORCED_DELAY_MS/1000)} segundos antes de procesar.`)
+      
+      // Marcar el mensaje con un estado especial para saber que está "esperando"
+      await conversationsCollection.updateMany(
+        { chatId: chatId, status: "pending" },
+        { 
+          $set: { 
+            waitUntil: new Date(latestMsgTime + FORCED_DELAY_MS),
+            waitingForDelay: true
+          } 
+        }
+      )
+      
+      console.log(`[${chatId}] Mensajes marcados para procesar después de ${new Date(latestMsgTime + FORCED_DELAY_MS).toISOString()}`)
+      return
+    }
+    
+    // Si hay mensajes marcados como "esperando" pero ya pasó el tiempo, los procesamos
+    if (!force) {
+      const waitingMessages = await conversationsCollection.countDocuments({
+        chatId: chatId,
+        waitingForDelay: true,
+        waitUntil: { $lte: now }
+      })
+      
+      if (waitingMessages > 0) {
+        console.log(`[${chatId}] Se encontraron ${waitingMessages} mensajes cuyo tiempo de espera ya pasó. Procesando...`)
+        force = true
+      }
+    }
+    
+    console.log(`[${chatId}] Procesando ${pendingMessages.length} mensajes acumulados después de espera adecuada`)
     
     // Paso 3: Marcar mensajes como "processing"
     const messageIds = pendingMessages.map(m => m._id)
     await conversationsCollection.updateMany(
       { _id: { $in: messageIds } },
-      { $set: { status: "processing" } }
+      { 
+        $set: { 
+          status: "processing",
+          waitingForDelay: false, // Quitar marca de espera
+          waitUntil: null // Limpiar el campo de tiempo
+        } 
+      }
     )
     
     // Paso 4: Procesar la conversación
@@ -124,33 +172,6 @@ async function processMessagesForChat(chatId: number, newMessageId: number, forc
       console.log(`[${chatId}] Procesamiento exitoso para ${pendingMessages.length} mensajes`)
     } else {
       console.log(`[${chatId}] El procesamiento no generó respuesta`)
-      
-      // Si no había suficiente contenido para procesar, reprogramar para
-      // forzar el procesamiento después de un tiempo
-      if (pendingMessages.length < 3) {
-        console.log(`[${chatId}] Pocos mensajes acumulados (${pendingMessages.length}), intentando forzar procesamiento después`)
-        
-        // Necesitamos programar otra función serverless para procesar más tarde
-        // Esto es solo para depuración - en producción necesitaríamos un mecanismo real
-        try {
-          // Llamada a nuestro propio endpoint para forzar el procesamiento
-          const baseUrl = process.env.VERCEL_URL 
-            ? `https://${process.env.VERCEL_URL}`
-            : 'http://localhost:3000';
-          
-          // Programar una llamada en 5 segundos a nuestro propio endpoint
-          setTimeout(async () => {
-            try {
-              console.log(`[${chatId}] Intentando forzar procesamiento después de espera`)
-              await processMessagesForChat(chatId, newMessageId, true)
-            } catch (err) {
-              console.error(`[${chatId}] Error al forzar procesamiento:`, err)
-            }
-          }, 5000)
-        } catch (fetchError) {
-          console.error(`[${chatId}] Error al programar procesamiento forzado:`, fetchError)
-        }
-      }
     }
     
   } catch (error: any) {
@@ -193,6 +214,35 @@ export default async function handler(
         return res.status(200).json({ message: '/start command handled' })
       }
 
+      // NUEVO: Verificar si hay mensajes esperando tiempo y ya pasó el tiempo requerido
+      const now = new Date()
+      const waitingMessagesReady = await conversationsCollection.find({
+        chatId: chatId,
+        waitingForDelay: true,
+        waitUntil: { $lte: now }
+      }).toArray()
+      
+      if (waitingMessagesReady.length > 0) {
+        console.log(`[${chatId}] Hay ${waitingMessagesReady.length} mensajes que esperaban tiempo y ya están listos para procesar`)
+        
+        // Guardar mensaje actual para procesarlo junto con los anteriores
+        await conversationsCollection.insertOne({
+          chatId: chatId,
+          message: messageData,
+          message_id: messageId,
+          timestamp: new Date(),
+          status: "pending" // Pendiente de procesamiento
+        })
+        console.log(`[${chatId}] Message saved to DB (ID: ${messageId}) - pending`)
+        
+        // Procesar todos inmediatamente, ya esperaron suficiente
+        await processMessagesForChat(chatId, messageId, true)
+        
+        // Responder a Telegram inmediatamente para no bloquear
+        res.status(200).json({ message: 'Update received and processed after delay' })
+        return
+      }
+
       // Guardar mensaje en MongoDB con estado "pending"
       await conversationsCollection.insertOne({
         chatId: chatId,
@@ -203,7 +253,7 @@ export default async function handler(
       })
       console.log(`[${chatId}] Message saved to DB (ID: ${messageId}) - pending`)
 
-      // Procesar mensajes (o postergar si son parte de una ráfaga)
+      // Procesar mensajes (o postergar si son parte de una ráfaga o necesitan más tiempo)
       await processMessagesForChat(chatId, messageId)
 
       // Responder a Telegram inmediatamente para no bloquear
