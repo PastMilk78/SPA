@@ -47,7 +47,7 @@ connectToDatabase().catch(console.error)
 
 // --- Debounce/Accumulation Mechanism --- 
 const processingTimers = new Map<number, NodeJS.Timeout>()
-const PROCESSING_DELAY_MS = 15000 // Esperar 15 segundos de inactividad para procesar
+const PROCESSING_DELAY_MS = 5000 // Esperar 5 segundos de inactividad para procesar
 const CONVERSATION_WINDOW_MINUTES = 5 // Considerar mensajes de los últimos 5 minutos
 // ------------------------------------
 
@@ -71,7 +71,7 @@ type ResponseData = {
 
 // --- Función principal de procesamiento (llamada por el timer) ---
 async function processConversation(chatId: number) {
-  console.log(`[${chatId}] Timer expired. Processing conversation...`)
+  console.log(`[${chatId}] ---- Entering processConversation ----`); // Log 1: Inicio de función
   try {
     const { conversationsCollection } = await connectToDatabase()
 
@@ -81,6 +81,8 @@ async function processConversation(chatId: number) {
       chatId: chatId,
       timestamp: { $gte: cutoffDate }
     }).sort({ timestamp: 1 }).toArray()
+    
+    console.log(`[${chatId}] Retrieved ${messages.length} messages from DB:`, JSON.stringify(messages.map(m => m.message.message_id))); // Log 2: Mensajes recuperados
 
     if (messages.length === 0) {
       console.log(`[${chatId}] No recent messages found to process.`)
@@ -153,6 +155,9 @@ async function processConversation(chatId: number) {
       } 
       // Ignorar video y otros tipos al construir el contenido para GPT
     }
+
+    // Fin del bucle for
+    console.log(`[${chatId}] Constructed userMessageContent:`, JSON.stringify(userMessageContent)); // Log 3: Contenido construido
 
     // Si solo hubo mensajes ignorados o errores, no llamar a GPT
     if (userMessageContent.length === 0) {
@@ -255,6 +260,7 @@ export default async function handler(
       }
 
       const newTimer = setTimeout(() => {
+        console.log(`[${chatId}] ---- setTimeout triggered ----`); // Log 4: Timer activado
         processConversation(chatId)
         processingTimers.delete(chatId) // Limpiar referencia al timer completado
       }, PROCESSING_DELAY_MS)
