@@ -70,10 +70,21 @@ export default async function handler(
       } else if (update.message.text) {
         // Procesar mensaje de texto
         text = update.message.text
+      } else if (update.message.photo) {
+        // Procesar mensaje de imagen (reconocimiento básico)
+        console.log('Received photo message');
+        await bot.sendMessage(chatId, 'He recibido tu imagen. Por el momento no puedo analizar el contenido, pero si tienes alguna consulta, puedes escribirme o enviar un audio.');
+        return res.status(200).json({ message: 'Photo message acknowledged' });
+      } else if (update.message.video) {
+        // Procesar mensaje de video (reconocimiento básico)
+        console.log('Received video message');
+        await bot.sendMessage(chatId, 'He recibido tu video. Por el momento no puedo analizar el contenido, pero si tienes alguna consulta, puedes escribirme o enviar un audio.');
+        return res.status(200).json({ message: 'Video message acknowledged' });
       } else {
-        // Ignorar otros tipos de mensajes por ahora
-        console.log('Ignoring non-text/non-voice message type')
-        return res.status(200).json({ message: 'Ignored message type' })
+        // Ignorar otros tipos de mensajes
+        console.log('Ignoring other message type');
+        await bot.sendMessage(chatId, 'Gracias por tu mensaje. Por ahora, solo puedo procesar consultas de texto o audio.');
+        return res.status(200).json({ message: 'Ignored other message type' });
       }
 
       // Si no tenemos texto (después de intentar procesar texto o voz), no continuamos
