@@ -46,8 +46,9 @@ connectToDatabase().catch(console.error)
 // --------------------------
 
 // --- Estrategia de acumulación ---
-const CONVERSATION_WINDOW_MINUTES = 5 // Considerar mensajes de los últimos 5 minutos
+const CONVERSATION_WINDOW_MINUTES = 30 // Aumentamos la ventana a 30 minutos para más contexto
 const BATCH_TIME_WINDOW_MS = 2000 // Ventana de tiempo para considerar mensajes "en ráfaga" (2 segundos)
+const MAX_CONVERSATION_HISTORY = 15 // Máximo número de mensajes a incluir en el historial
 // ------------------------------------
 
 // Inicializar OpenAI (ya incluye GPT-4o con visión)
@@ -225,24 +226,44 @@ async function processConversation(chatId: number): Promise<boolean> {
   try {
     const { conversationsCollection } = await connectToDatabase()
 
-    // Recuperar mensajes en estado "processing" para este chat
-    const messages = await conversationsCollection.find({
+    // 1. Recuperar mensajes en estado "processing" para este chat (los que queremos procesar ahora)
+    const messagesToProcess = await conversationsCollection.find({
       chatId: chatId,
-      status: "processing" // Solo procesar los que están en este estado
+      status: "processing" // Solo los que están esperando ser procesados ahora
     }).sort({ timestamp: 1 }).toArray()
     
-    console.log(`[${chatId}] Retrieved ${messages.length} messages from DB:`, 
-      messages.length > 0 ? JSON.stringify(messages.map(m => m.message.message_id)) : "none");
+    console.log(`[${chatId}] Retrieved ${messagesToProcess.length} messages to process:`, 
+      messagesToProcess.length > 0 ? JSON.stringify(messagesToProcess.map(m => m.message.message_id)) : "none");
 
-    if (messages.length === 0) {
+    if (messagesToProcess.length === 0) {
       console.log(`[${chatId}] No messages found to process.`)
       return false
     }
     
+    // 2. Recuperar también mensajes históricos (procesados recientemente) para contexto
+    const cutoffDate = new Date(Date.now() - CONVERSATION_WINDOW_MINUTES * 60 * 1000)
+    const historyMessages = await conversationsCollection.find({
+      chatId: chatId,
+      status: "processed",
+      timestamp: { $gte: cutoffDate }
+    }).sort({ timestamp: -1 }) // Más recientes primero
+    .limit(MAX_CONVERSATION_HISTORY) // Limitar cantidad para no sobrecargar
+    .toArray()
+    
+    console.log(`[${chatId}] Retrieved ${historyMessages.length} historical messages for context`)
+    
+    // 3. Ordenar todos los mensajes cronológicamente (historia + nuevos)
+    const allMessages = [...historyMessages.reverse(), ...messagesToProcess].sort((a, b) => {
+      return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    })
+    
+    console.log(`[${chatId}] Processing ${messagesToProcess.length} new messages with ${historyMessages.length} historical messages for context (total: ${allMessages.length})`)
+    
+    // 4. Construir el contenido con todos los mensajes
     let userMessageContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = []
     let hasProcessedMedia = false
 
-    for (const msgDoc of messages) {
+    for (const msgDoc of allMessages) {
       const message = msgDoc.message
       let textPart = ''
       let imageBase64 = ''
@@ -304,9 +325,9 @@ async function processConversation(chatId: number): Promise<boolean> {
 
     if (userMessageContent.length === 0) {
       console.log(`[${chatId}] No processable content found for GPT.`)
-      // Marcar como procesados
+      // Marcar solo los mensajes que estaban en "processing" como "processed"
       await conversationsCollection.updateMany(
-        { chatId: chatId, _id: { $in: messages.map(m => m._id) } },
+        { chatId: chatId, _id: { $in: messagesToProcess.map(m => m._id) } },
         { $set: { status: "processed" } }
       )
       console.log(`[${chatId}] Marked messages as processed.`)
@@ -315,16 +336,33 @@ async function processConversation(chatId: number): Promise<boolean> {
 
     try {
       console.log(`[${chatId}] Sending accumulated content to GPT-4o:`, userMessageContent.length, "parts")
+      
+      // Preparamos un mensaje más claro para el sistema sobre la conversación
+      const systemMessage = `Actúas como un asesor de Solar Pro Argentina (https://solarproargentina.com/). 
+Eres parte del equipo humano. No menciones que eres IA. 
+
+CONTEXTO: A continuación verás una conversación que puede incluir mensajes recientes y anteriores. 
+IMPORTANTE: Debes entender el HILO COMPLETO de la conversación, no solo responder al último mensaje.
+Analiza todos los mensajes del usuario para dar una respuesta coherente.
+
+Tu misión es resolver dudas sobre paneles solares, explicar beneficios, informar sobre servicios (domiciliarios, comerciales, industriales), 
+promover cotizaciones gratuitas (web/WhatsApp) y generar confianza (compromiso, sustentabilidad, calidad, atención personalizada). 
+
+Usa lenguaje sencillo y cálido. No inventes precios/productos. Si no sabes algo, invita a contactar a un asesor. 
+Evita tecnicismos excesivos. Sé cordial y enfócate en lo que el cliente está preguntando.
+
+Si hay imágenes, analízalas en el contexto de Solar Pro (producto, factura, instalación relevante?). Nunca digas que eres un bot.`;
+      
       const completion = await openai.chat.completions.create({
         model: "gpt-4o", 
         messages: [
           { 
             role: "system", 
-            content: "Actúas como un asesor de Solar Pro Argentina (https://solarproargentina.com/). Eres parte del equipo humano. No menciones que eres IA. Tu misión es resolver dudas sobre paneles solares, explicar beneficios, informar sobre servicios (domiciliarios, comerciales, industriales), promover cotizaciones gratuitas (web/WhatsApp) y generar confianza (compromiso, sustentabilidad, calidad, atención personalizada). Usa lenguaje sencillo y cálido. No inventes precios/productos. Si no sabes algo, invita a contactar a un asesor. Evita tecnicismos. Sé cordial. Analiza la secuencia completa de mensajes del usuario, incluyendo textos, audios transcritos e imágenes, para dar una respuesta coherente. Si hay imágenes, analízalas en el contexto de Solar Pro (producto, factura, instalación relevante?). Nunca digas que eres un bot."
+            content: systemMessage
           },
           { 
             role: "user", 
-            content: userMessageContent // Array acumulado
+            content: userMessageContent // Array acumulado con historial + nuevos mensajes
           } 
         ],
       })
@@ -337,7 +375,6 @@ async function processConversation(chatId: number): Promise<boolean> {
         console.log(`[${chatId}] Response sent to Telegram.`)
       } catch (sendError: any) {
         console.error(`[${chatId}] ERROR ENVIANDO MENSAJE A TELEGRAM:`, sendError?.message)
-        // Intentar enviar nuevamente con un mensaje de error en caso de fallar
         try {
           await bot.sendMessage(chatId, 'Lo siento, tuve un problema al enviar mi respuesta. Por favor, intenta nuevamente.')
         } catch (e) {
@@ -345,14 +382,15 @@ async function processConversation(chatId: number): Promise<boolean> {
         }
       }
 
-      // Marcar mensajes como procesados
+      // Marcar SOLO los mensajes que estaban en "processing" como "processed"
+      // Los mensajes históricos ya estaban como "processed"
       await conversationsCollection.updateMany(
-        { chatId: chatId, _id: { $in: messages.map(m => m._id) } },
+        { chatId: chatId, _id: { $in: messagesToProcess.map(m => m._id) } },
         { $set: { status: "processed" } }
       )
-      console.log(`[${chatId}] Marked ${messages.length} messages as processed.`)
+      console.log(`[${chatId}] Marked ${messagesToProcess.length} new messages as processed.`)
       
-      return true // Procesamiento exitoso
+      return true
 
     } catch (error: any) {
       console.error(`[${chatId}] Error with OpenAI API call:`, error?.message)
@@ -366,12 +404,12 @@ async function processConversation(chatId: number): Promise<boolean> {
       
       // En caso de error, marcar mensajes como fallidos pero no eliminarlos
       await conversationsCollection.updateMany(
-        { chatId: chatId, _id: { $in: messages.map(m => m._id) } },
+        { chatId: chatId, _id: { $in: messagesToProcess.map(m => m._id) } },
         { $set: { status: "error" } }
       )
       console.log(`[${chatId}] Marked messages as error.`)
       
-      return false // Procesamiento fallido
+      return false
     }
 
   } catch (processError: any) {
@@ -384,6 +422,6 @@ async function processConversation(chatId: number): Promise<boolean> {
       console.error(`[${chatId}] CRITICAL: Failed to send critical error message:`, e)
     }
     
-    return false // Procesamiento fallido
+    return false
   }
 } 
