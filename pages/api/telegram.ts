@@ -2,16 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next'
 import TelegramBot from 'node-telegram-bot-api'
 import OpenAI from 'openai'
 import fetch from 'node-fetch'
-import { Readable } from 'stream'
-
-// Función auxiliar para convertir ReadableStream a buffer (versión compatible)
-async function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
-  const chunks: Buffer[] = []
-  for await (const chunk of stream) {
-    chunks.push(Buffer.from(chunk))
-  }
-  return Buffer.concat(chunks)
-}
+import FormData from 'form-data'
 
 // Inicializar OpenAI
 const openai = new OpenAI({
@@ -60,32 +51,40 @@ export default async function handler(
           throw new Error(`Failed to download audio file: ${audioResponse.statusText}`)
         }
         
-        console.log('Audio downloaded, sending to Whisper...')
+        console.log('Audio downloaded, preparing FormData for Whisper API...')
         
-        // Enviar a Whisper para transcribir
-        try {
-          // Convertir el stream a buffer primero
-          const audioBuffer = await streamToBuffer(audioResponse.body as unknown as NodeJS.ReadableStream)
-          console.log(`Audio buffer size for transcription: ${audioBuffer.length}`)
-          
-          // Crear un objeto "File-like" con el buffer y metadatos
-          const audioFile = {
-            name: "audio.ogg", // Nombre de archivo requerido
-            type: "audio/ogg", // Tipo MIME
-            // La librería debería poder manejar el buffer directamente aquí si el objeto "parece" un archivo
-            buffer: audioBuffer 
-          };
+        // Crear FormData y adjuntar el stream
+        const form = new FormData()
+        form.append('file', audioResponse.body, { filename: 'audio.ogg', contentType: 'audio/ogg' })
+        form.append('model', 'whisper-1')
+        // Podríamos agregar otros parámetros como language si es necesario
+        // form.append('language', 'es')
 
-          const transcription = await openai.audio.transcriptions.create({
-            // @ts-ignore - Forzar el tipo si el linter sigue quejándose, aunque esperamos que el objeto "File-like" funcione
-            file: audioFile as any, 
-            model: "whisper-1",
-          });
-          text = transcription.text;
-          console.log('Transcription:', text);
-        } catch (transcriptionError) {
-          console.error('Error during transcription:', transcriptionError)
-          await bot.sendMessage(chatId, 'Lo siento, tuve problemas para entender el audio. ¿Podrías intentarlo de nuevo o escribir tu consulta?')
+        // Enviar a la API de Whisper manualmente
+        try {
+          const whisperApiUrl = 'https://api.openai.com/v1/audio/transcriptions'
+          const whisperResponse = await fetch(whisperApiUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+              // Los headers de FormData se establecen automáticamente
+              ...form.getHeaders()
+            },
+            body: form
+          })
+
+          const whisperResult = await whisperResponse.json()
+
+          if (!whisperResponse.ok) {
+            console.error('Whisper API Error:', whisperResult)
+            throw new Error(`Whisper API request failed: ${whisperResult?.error?.message || whisperResponse.statusText}`)
+          }
+
+          text = whisperResult.text
+          console.log('Transcription successful:', text)
+        } catch (transcriptionError: any) {
+          console.error('Error during manual transcription API call:', transcriptionError?.message)
+          await bot.sendMessage(chatId, 'Lo siento, tuve problemas técnicos (interno) para entender el audio. ¿Podrías intentarlo de nuevo o escribir tu consulta?')
           return res.status(200).json({ message: 'Transcription error handled' })
         }
       
@@ -94,25 +93,29 @@ export default async function handler(
         text = update.message.text
       } else if (update.message.photo) {
         // Procesar mensaje de imagen (reconocimiento básico)
-        console.log('Received photo message');
-        await bot.sendMessage(chatId, 'He recibido tu imagen. Por el momento no puedo analizar el contenido, pero si tienes alguna consulta, puedes escribirme o enviar un audio.');
-        return res.status(200).json({ message: 'Photo message acknowledged' });
+        console.log('Received photo message')
+        await bot.sendMessage(chatId, 'He recibido tu imagen. Por el momento no puedo analizar el contenido, pero si tienes alguna consulta, puedes escribirme o enviar un audio.')
+        return res.status(200).json({ message: 'Photo message acknowledged' })
       } else if (update.message.video) {
         // Procesar mensaje de video (reconocimiento básico)
-        console.log('Received video message');
-        await bot.sendMessage(chatId, 'He recibido tu video. Por el momento no puedo analizar el contenido, pero si tienes alguna consulta, puedes escribirme o enviar un audio.');
-        return res.status(200).json({ message: 'Video message acknowledged' });
+        console.log('Received video message')
+        await bot.sendMessage(chatId, 'He recibido tu video. Por el momento no puedo analizar el contenido, pero si tienes alguna consulta, puedes escribirme o enviar un audio.')
+        return res.status(200).json({ message: 'Video message acknowledged' })
       } else {
         // Ignorar otros tipos de mensajes
-        console.log('Ignoring other message type');
-        await bot.sendMessage(chatId, 'Gracias por tu mensaje. Por ahora, solo puedo procesar consultas de texto o audio.');
-        return res.status(200).json({ message: 'Ignored other message type' });
+        console.log('Ignoring other message type')
+        await bot.sendMessage(chatId, 'Gracias por tu mensaje. Por ahora, solo puedo procesar consultas de texto o audio.')
+        return res.status(200).json({ message: 'Ignored other message type' })
       }
 
       // Si no tenemos texto (después de intentar procesar texto o voz), no continuamos
       if (!text) {
         console.log('No text to process after handling message/voice.')
-        return res.status(400).json({ message: 'No processable text found' })
+        // Evitar error 400 si solo fue un ack de foto/video
+        if (!update.message.photo && !update.message.video) {
+          return res.status(400).json({ message: 'No processable text found' })
+        }
+        return res.status(200).json({ message: 'Media message acknowledged, no text to process' })
       }
 
       // Si el texto es un comando, procesarlo diferente
@@ -155,7 +158,7 @@ export default async function handler(
     console.log('No message found in update object')
     return res.status(400).json({ message: 'No message found in update' })
   } catch (error) {
-    console.error('Error processing update:', error)
-    return res.status(500).json({ message: 'Error processing update' })
+    console.error('General error processing update:', error)
+    return res.status(500).json({ message: 'General error processing update' })
   }
 } 
