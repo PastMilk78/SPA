@@ -47,7 +47,7 @@ connectToDatabase().catch(console.error)
 
 // --- Debounce/Accumulation Mechanism --- 
 const processingTimers = new Map<number, NodeJS.Timeout>()
-const PROCESSING_DELAY_MS = 5000 // Esperar 5 segundos de inactividad para procesar
+const PROCESSING_DELAY_MS = 15000 // Esperar 15 segundos de inactividad para procesar
 const CONVERSATION_WINDOW_MINUTES = 5 // Considerar mensajes de los últimos 5 minutos
 // ------------------------------------
 
