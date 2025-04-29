@@ -46,8 +46,9 @@ connectToDatabase().catch(console.error)
 // --------------------------
 
 // --- Debounce/Accumulation Mechanism --- 
-const processingTimers = new Map<number, NodeJS.Timeout>()
-const PROCESSING_DELAY_MS = 5000 // Esperar 5 segundos de inactividad para procesar
+// Se elimina el mecanismo de debounce/setTimeout
+// const processingTimers = new Map<number, NodeJS.Timeout>()
+// const PROCESSING_DELAY_MS = 5000 // Esperar 5 segundos de inactividad para procesar
 const CONVERSATION_WINDOW_MINUTES = 5 // Considerar mensajes de los últimos 5 minutos
 // ------------------------------------
 
@@ -214,7 +215,7 @@ async function processConversation(chatId: number) {
 }
 // ----------------------------------------------------------------------
 
-// --- Handler principal (recibe webhook, guarda en DB, gestiona timer) ---
+// --- Handler principal (recibe webhook, guarda en DB, y procesa) ---
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<ResponseData>
@@ -226,7 +227,7 @@ export default async function handler(
 
   try {
     const update = req.body
-    
+
     if (update && update.message && update.message.chat && update.message.chat.id) {
       const chatId = update.message.chat.id
       const messageData = update.message
@@ -234,7 +235,23 @@ export default async function handler(
       // Conectar a DB (o reusar conexión)
       const { conversationsCollection } = await connectToDatabase()
 
-      // Guardar mensaje en MongoDB
+      // Manejo especial para /start (respuesta rápida)
+      if (messageData.text && messageData.text === '/start') {
+        // Guardar el mensaje /start ANTES de responder, para que se limpie luego si es necesario
+        await conversationsCollection.insertOne({
+          chatId: chatId,
+          message: messageData,
+          timestamp: new Date()
+        })
+        console.log(`[${chatId}] /start message saved to DB (ID: ${messageData.message_id})`)
+        await bot.sendMessage(chatId, '¡Hola! Soy un asesor de Solar Pro Argentina. ¿En qué puedo ayudarte?')
+        // Aún así llamaremos a processConversation para limpiar el mensaje /start de la DB
+        await processConversation(chatId)
+        // Responder a Telegram que el comando /start fue manejado (pero el procesamiento general ocurrió)
+        return res.status(200).json({ message: '/start command handled and processed' })
+      }
+
+      // Guardar mensaje en MongoDB (si no es /start)
       await conversationsCollection.insertOne({
         chatId: chatId,
         message: messageData,
@@ -242,33 +259,15 @@ export default async function handler(
       })
       console.log(`[${chatId}] Message saved to DB (ID: ${messageData.message_id})`)
 
-      // Manejar comandos /start inmediatamente (opcional, o dejar que se procesen con el resto)
-      if (messageData.text && messageData.text === '/start') {
-        await bot.sendMessage(chatId, '¡Hola! Soy un asesor de Solar Pro Argentina. ¿En qué puedo ayudarte?') 
-        // Limpiar timer si existía, ya que respondimos
-        const existingTimer = processingTimers.get(chatId)
-        if (existingTimer) clearTimeout(existingTimer)
-        processingTimers.delete(chatId)
-        // Podríamos limpiar los mensajes de la DB también, o dejar que se limpien luego
-        return res.status(200).json({ message: '/start command handled' })
-      }
-      
-      // Gestionar timer para procesar conversación
-      const existingTimer = processingTimers.get(chatId)
-      if (existingTimer) {
-        clearTimeout(existingTimer)
-      }
+      // Procesar la conversación inmediatamente
+      console.log(`[${chatId}] Calling processConversation immediately...`)
+      await processConversation(chatId) // Llamada directa
+      console.log(`[${chatId}] processConversation finished.`)
 
-      const newTimer = setTimeout(() => {
-        console.log(`[${chatId}] ---- setTimeout triggered ----`); // Log 4: Timer activado
-        processConversation(chatId)
-        processingTimers.delete(chatId) // Limpiar referencia al timer completado
-      }, PROCESSING_DELAY_MS)
 
-      processingTimers.set(chatId, newTimer)
-
-      // Responder a Telegram inmediatamente
-      res.status(200).json({ message: 'Update received and saved' })
+      // Responder a Telegram después de procesar
+      // Nota: Si processConversation tarda mucho, esto podría dar timeout.
+      res.status(200).json({ message: 'Update received and processed' })
 
     } else {
       console.log('Received update without message or chat ID:', JSON.stringify(update))
@@ -277,6 +276,17 @@ export default async function handler(
 
   } catch (error: any) {
     console.error('General error in handler:', error?.message)
-    res.status(500).json({ message: 'General error processing update handler' })
+    // Intentar notificar al usuario si es posible
+    if (error?.config?.chatId) { // Si el error ocurrió dentro de processConversation (hipotético)
+       try {
+          await bot.sendMessage(error.config.chatId, 'Lo siento, ocurrió un error inesperado al procesar tu solicitud.');
+       } catch (sendError) {
+          console.error("Failed to send error message to user:", sendError);
+       }
+    }
+    // Responder con error genérico
+    if (!res.headersSent) { // Evitar enviar respuesta si ya se envió o hubo error grave
+        res.status(500).json({ message: 'General error processing update handler' })
+    }
   }
 } 
