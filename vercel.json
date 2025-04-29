@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "crons": [
+    {
+      "path": "/api/cron",
+      "schedule": "* * * * *"
+    }
+  ],
+  "env": {
+    "CRON_SECRET": "@cron_secret"
+  }
+} 

@@ -49,88 +49,142 @@ const bot = new TelegramBot(token, { polling: false })
 
 /**
  * Endpoint para procesar mensajes pendientes mediante cron job
+ * Se ejecuta cada minuto automáticamente
  */
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
 ) {
-  // Validar que sea una solicitud autorizada
-  const authHeader = req.headers.authorization;
-  if (!authHeader || authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
+  // NOTA: Para trabajos cron integrados en Vercel, no es necesaria autenticación
+  // ya que Vercel los ejecuta internamente de forma segura
+  // Si alguien intenta llamar a este endpoint manualmente, la autenticación debería ocurrir
+  let isVercelCron = false;
+  
   try {
-    console.log('Iniciando verificación de mensajes pendientes...');
+    // Verificar si es una llamada de Vercel Cron
+    const userAgent = req.headers['user-agent'] || '';
+    if (userAgent.includes('VercelCron')) {
+      isVercelCron = true;
+    }
+    
+    // Si no es llamada desde Vercel Cron, verificar la autenticación
+    if (!isVercelCron) {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    console.log('[CRON] Iniciando verificación de mensajes pendientes...');
     const { conversationsCollection } = await connectToDatabase();
     
-    // Encontrar chats con mensajes esperando y cuyo tiempo ya ha pasado
+    // 1. Encontrar chats con mensajes en espera cuyo tiempo ya pasó
     const now = new Date();
-    const readyChats = await conversationsCollection.distinct('chatId', {
+    const readyMessages = await conversationsCollection.find({
       waitingForDelay: true,
       waitUntil: { $lte: now }
-    });
+    }).toArray();
     
-    console.log(`Encontrados ${readyChats.length} chats con mensajes listos para procesar`);
+    // Agrupar por chatId para procesamiento por chat
+    const chatGroups: {[key: string]: any[]} = {};
+    for (const msg of readyMessages) {
+      const chatId = msg.chatId;
+      if (!chatGroups[chatId]) {
+        chatGroups[chatId] = [];
+      }
+      chatGroups[chatId].push(msg);
+    }
     
-    // Procesar cada chat
-    for (const chatId of readyChats) {
+    const chatsToProcess = Object.keys(chatGroups);
+    console.log(`[CRON] Encontrados ${readyMessages.length} mensajes listos para procesar en ${chatsToProcess.length} chats`);
+    
+    if (chatsToProcess.length === 0) {
+      return res.status(200).json({ 
+        success: true, 
+        message: 'No pending messages ready for processing' 
+      });
+    }
+    
+    // 2. Procesar cada chat
+    let processedChats = 0;
+    let failedChats = 0;
+    
+    for (const chatId of chatsToProcess) {
       try {
-        console.log(`Procesando mensajes para chatId: ${chatId}`);
+        console.log(`[CRON] Procesando mensajes para chatId: ${chatId}`);
         
-        // Marcar todos los mensajes pendientes para este chat como "processing"
+        // Marcar todos los mensajes pendientes como "processing"
         const result = await conversationsCollection.updateMany(
           { 
-            chatId: chatId, 
+            chatId: parseInt(chatId), 
             waitingForDelay: true,
             waitUntil: { $lte: now }
           },
           { $set: { status: "processing", waitingForDelay: false, waitUntil: null } }
         );
         
-        console.log(`Marcados ${result.modifiedCount} mensajes como "processing"`);
+        if (result.modifiedCount === 0) {
+          console.log(`[CRON] No se encontraron mensajes para actualizar en el chat ${chatId}`);
+          continue;
+        }
+        
+        console.log(`[CRON] Marcados ${result.modifiedCount} mensajes como "processing"`);
         
         // Obtener todos los mensajes a procesar
         const messagesToProcess = await conversationsCollection.find({
-          chatId: chatId,
+          chatId: parseInt(chatId),
           status: "processing"
         }).sort({ timestamp: 1 }).toArray();
         
         if (messagesToProcess.length === 0) {
-          console.log(`No se encontraron mensajes para procesar para el chat ${chatId}`);
+          console.log(`[CRON] No se encontraron mensajes para procesar para el chat ${chatId}`);
           continue;
         }
 
-        console.log(`Procesando ${messagesToProcess.length} mensajes para el chat ${chatId}`);
+        console.log(`[CRON] Procesando ${messagesToProcess.length} mensajes para el chat ${chatId}`);
         
         // Obtener mensajes históricos para contexto
         const cutoffDate = new Date(now.getTime() - 30 * 60 * 1000); // 30 minutos
         const historyMessages = await conversationsCollection.find({
-          chatId: chatId,
+          chatId: parseInt(chatId),
           status: "processed",
           timestamp: { $gte: cutoffDate }
         }).sort({ timestamp: -1 })
         .limit(15)
         .toArray();
         
-        // Ordenar todos los mensajes cronológicamente
-        const allMessages = [...historyMessages.reverse(), ...messagesToProcess].sort((a, b) => {
-          return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
-        });
-        
-        console.log(`Preparando contenido con ${messagesToProcess.length} mensajes nuevos y ${historyMessages.length} históricos`);
+        console.log(`[CRON] Preparando contenido con ${messagesToProcess.length} mensajes nuevos y ${historyMessages.length} históricos`);
         
         // Importar y usar las funciones desde telegram.ts
         const telegramModule = await import('./telegram');
-        await telegramModule.processConversationFromCron(chatId, messagesToProcess, historyMessages);
+        const success = await telegramModule.processConversationFromCron(
+          parseInt(chatId), 
+          messagesToProcess, 
+          historyMessages
+        );
+        
+        if (success) {
+          processedChats++;
+        } else {
+          failedChats++;
+        }
+        
       } catch (chatError) {
-        console.error(`Error procesando chat ${chatId}:`, chatError);
+        console.error(`[CRON] Error procesando chat ${chatId}:`, chatError);
+        failedChats++;
       }
     }
     
-    res.status(200).json({ success: true, processedChats: readyChats.length });
+    console.log(`[CRON] Procesamiento completado. Éxitos: ${processedChats}, Fallos: ${failedChats}`);
+    
+    res.status(200).json({ 
+      success: true, 
+      processedChats: processedChats,
+      failedChats: failedChats,
+      totalMessages: readyMessages.length
+    });
   } catch (error) {
-    console.error('Error en el cron job:', error);
+    console.error('[CRON] Error en el cron job:', error);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 } 

@@ -39,11 +39,14 @@ async function connectToDatabase() {
 
 /**
  * Endpoint para forzar el procesamiento de mensajes pendientes
+ * Accesible desde el navegador para procesamiento manual
  */
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
 ) {
+  // Permitir acceso desde el navegador para depuración
+  // IMPORTANTE: En producción, esto debería tener autenticación
   try {
     console.log('[MANUAL] Iniciando procesamiento manual de mensajes pendientes...');
     const { conversationsCollection } = await connectToDatabase();
@@ -54,6 +57,13 @@ export default async function handler(
       waitingForDelay: true,
       waitUntil: { $lte: now }
     }).toArray();
+    
+    if (pendingMessages.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'No hay mensajes pendientes listos para procesar'
+      });
+    }
     
     // Agrupar por chatId
     const chatGroups: {[key: string]: any[]} = {};
@@ -68,39 +78,121 @@ export default async function handler(
     const chatsToProcess = Object.keys(chatGroups);
     console.log(`[MANUAL] Encontrados ${pendingMessages.length} mensajes pendientes en ${chatsToProcess.length} chats`);
     
+    // Resultado HTML para mostrar en el navegador
+    let resultHtml = `
+    <html>
+    <head>
+      <title>Procesamiento de Mensajes</title>
+      <style>
+        body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }
+        h1 { color: #333; }
+        .info { background-color: #e6f7ff; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .success { background-color: #f6ffed; border: 1px solid #b7eb8f; padding: 10px; margin: 5px 0; border-radius: 3px; }
+        .error { background-color: #fff1f0; border: 1px solid #ffa39e; padding: 10px; margin: 5px 0; border-radius: 3px; }
+        .processing { background-color: #fffbe6; border: 1px solid #ffe58f; padding: 10px; margin: 5px 0; border-radius: 3px; }
+        pre { background: #f5f5f5; padding: 10px; overflow: auto; }
+      </style>
+    </head>
+    <body>
+      <h1>Procesamiento Manual de Mensajes</h1>
+      <div class="info">
+        <p>Encontrados ${pendingMessages.length} mensajes pendientes en ${chatsToProcess.length} chats.</p>
+      </div>
+    `;
+    
     // Para cada chat, marcar los mensajes como "processing"
+    let processedChats = 0;
+    let attemptedChats = 0;
+    
+    // Procesamos cada chat
     for (const chatId of chatsToProcess) {
-      const messageIds = chatGroups[chatId].map(m => m._id);
-      await conversationsCollection.updateMany(
-        { _id: { $in: messageIds } },
-        { $set: { status: "processing", waitingForDelay: false, waitUntil: null } }
-      );
-      
-      // Llamar al endpoint de telegram para procesar
       try {
-        const result = await fetch(`${req.headers.host}/api/telegram/process?chatId=${chatId}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.API_SECRET_KEY || 'default-secret'}`
-          }
-        });
+        resultHtml += `<div class="processing">Procesando chat ${chatId}...</div>`;
+        attemptedChats++;
         
-        if (!result.ok) {
-          console.error(`[MANUAL] Error procesando chat ${chatId}: ${result.statusText}`);
+        const messageIds = chatGroups[chatId].map(m => m._id);
+        await conversationsCollection.updateMany(
+          { _id: { $in: messageIds } },
+          { $set: { status: "processing", waitingForDelay: false, waitUntil: null } }
+        );
+        
+        // Obtener mensajes a procesar
+        const messagesToProcess = await conversationsCollection.find({
+          chatId: parseInt(chatId),
+          status: "processing"
+        }).sort({ timestamp: 1 }).toArray();
+        
+        // Obtener historial
+        const historyMessages = await conversationsCollection.find({
+          chatId: parseInt(chatId),
+          status: "processed",
+          timestamp: { $gte: new Date(Date.now() - 30 * 60 * 1000) } // 30 minutos
+        }).sort({ timestamp: -1 }).limit(15).toArray();
+        
+        // Importar módulo de telegram y procesar conversación
+        const telegramModule = await import('./telegram');
+        const success = await telegramModule.processConversationFromCron(
+          parseInt(chatId),
+          messagesToProcess,
+          historyMessages
+        );
+        
+        if (success) {
+          processedChats++;
+          resultHtml += `<div class="success">Chat ${chatId} procesado con éxito (${messagesToProcess.length} mensajes)</div>`;
+        } else {
+          resultHtml += `<div class="error">Error al procesar chat ${chatId}</div>`;
         }
-      } catch (fetchError) {
-        console.error(`[MANUAL] Error llamando al endpoint de procesamiento para chat ${chatId}:`, fetchError);
+      } catch (chatError: any) {
+        console.error(`[MANUAL] Error procesando chat ${chatId}:`, chatError);
+        resultHtml += `<div class="error">Error al procesar chat ${chatId}: ${chatError.message}</div>`;
       }
     }
     
-    res.status(200).json({ 
-      success: true, 
-      message: `Programado procesamiento para ${chatsToProcess.length} chats con ${pendingMessages.length} mensajes pendientes` 
-    });
+    resultHtml += `
+      <div class="info">
+        <p>Completado: ${processedChats} de ${attemptedChats} chats procesados correctamente.</p>
+        <p><a href="javascript:window.location.reload()">Actualizar</a></p>
+      </div>
+    </body>
+    </html>`;
     
-  } catch (error) {
+    // Si es una solicitud desde el navegador, devolver HTML
+    if (req.headers.accept && req.headers.accept.includes('text/html')) {
+      res.setHeader('Content-Type', 'text/html');
+      res.status(200).send(resultHtml);
+    } else {
+      // Si es una API request, devolver JSON
+      res.status(200).json({
+        success: true,
+        processedChats: processedChats,
+        totalChats: chatsToProcess.length,
+        totalMessages: pendingMessages.length
+      });
+    }
+    
+  } catch (error: any) {
     console.error('[MANUAL] Error en el procesamiento manual:', error);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    
+    // Si es una solicitud desde el navegador, devolver HTML con error
+    if (req.headers.accept && req.headers.accept.includes('text/html')) {
+      res.setHeader('Content-Type', 'text/html');
+      res.status(500).send(`
+        <html>
+          <head><title>Error</title><style>body{font-family:Arial;margin:20px;}</style></head>
+          <body>
+            <h1>Error</h1>
+            <p>Ocurrió un error al procesar los mensajes: ${error.message}</p>
+            <p><a href="javascript:window.location.reload()">Intentar de nuevo</a></p>
+          </body>
+        </html>
+      `);
+    } else {
+      // Si es una API request, devolver JSON con error
+      res.status(500).json({ 
+        error: 'Error interno del servidor',
+        message: error.message
+      });
+    }
   }
 } 
