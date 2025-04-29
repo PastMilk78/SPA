@@ -2,6 +2,16 @@ import type { NextApiRequest, NextApiResponse } from 'next'
 import TelegramBot from 'node-telegram-bot-api'
 import OpenAI from 'openai'
 import fetch from 'node-fetch'
+import { Readable } from 'stream'
+
+// Función auxiliar para convertir ReadableStream a buffer (versión compatible)
+async function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  for await (const chunk of stream) {
+    chunks.push(Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks)
+}
 
 // Inicializar OpenAI
 const openai = new OpenAI({
@@ -52,15 +62,27 @@ export default async function handler(
         
         console.log('Audio downloaded, sending to Whisper...')
         
-        // Enviar a Whisper para transcribir directamente el stream
+        // Enviar a Whisper para transcribir
         try {
+          // Convertir el stream a buffer primero
+          const audioBuffer = await streamToBuffer(audioResponse.body as unknown as NodeJS.ReadableStream)
+          console.log(`Audio buffer size for transcription: ${audioBuffer.length}`)
+          
+          // Crear un objeto "File-like" con el buffer y metadatos
+          const audioFile = {
+            name: "audio.ogg", // Nombre de archivo requerido
+            type: "audio/ogg", // Tipo MIME
+            // La librería debería poder manejar el buffer directamente aquí si el objeto "parece" un archivo
+            buffer: audioBuffer 
+          };
+
           const transcription = await openai.audio.transcriptions.create({
-            // @ts-ignore - Forzar el tipo ya que la librería espera Uploadable pero fetch devuelve ReadableStream
-            file: audioResponse.body,
+            // @ts-ignore - Forzar el tipo si el linter sigue quejándose, aunque esperamos que el objeto "File-like" funcione
+            file: audioFile as any, 
             model: "whisper-1",
-          })
-          text = transcription.text
-          console.log('Transcription:', text)
+          });
+          text = transcription.text;
+          console.log('Transcription:', text);
         } catch (transcriptionError) {
           console.error('Error during transcription:', transcriptionError)
           await bot.sendMessage(chatId, 'Lo siento, tuve problemas para entender el audio. ¿Podrías intentarlo de nuevo o escribir tu consulta?')
