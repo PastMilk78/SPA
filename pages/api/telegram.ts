@@ -55,7 +55,7 @@ export default async function handler(
             { role: "system", content: "Eres un asistente amable y profesional que ayuda a los usuarios con sus consultas. Tus respuestas son concisas y útiles." },
             { role: "user", content: text }
           ],
-          model: "gpt-3.5-turbo",
+          model: "gpt-4o",
         })
 
         const reply = completion.choices[0]?.message?.content || 'Lo siento, no pude procesar tu mensaje.'
